@@ -1,0 +1,490 @@
+---
+title: "The Politicization and Polarization of the Coronavirus on Facebook"
+author: "Christian Staal Bruun Overgaard"
+date: "Fall semester, 2020"
+output: html_document
+---
+
+## Prepare Data
+### Load Packages and Set Seed
+```{r load_packages}
+script_start <- Sys.time() #measure runtime
+options(scipen=999)
+set.seed(100)
+
+library(ggthemes)
+library(gganimate)
+library(gifski)
+library(quanteda)
+library(readr)
+library(writexl)
+
+#some extra packages for wrangling date-times
+library(xts)
+library(lubridate)
+library(zoo)
+library(tsibble)
+
+#for LDA topic modeling
+library(tidytext)
+library(topicmodels)
+library(ldatuning)
+
+#for supervised machine learning
+library(quanteda.textmodels)
+library(tokenizers)
+library(caret)
+library(tm)
+library(e1071)
+library(ROSE)
+library(DMwR)
+
+#core packages
+library(tidyverse)
+library(plyr) #if other packages mask eg "select", it causes trouble
+
+```
+
+### Import Data
+
+```{r include=FALSE}
+getwd() 
+load("hw4_df.Rda") #this .Rda file was saved from a DF called "dat_dsc", so merely loading it (without assigning it to an object) is enough; it will still go into the environment under "data_csv".
+```
+
+### Specify DF
+
+```{r}
+df <- dat_csv  #USE THIS CODE FOR WORKING WITH FULL DATASET
+#df <- dat_csv[sample(nrow(dat_csv), 1000), ] #USE THIS FOR WORKING WITH RANDOM SAMPLE OF X POSTS. (Seed is set at top!)
+```
+
+
+### Data Cleaning
+```{r}
+df$Created <- as.POSIXct(df$Created, tryFormats = "%Y-%m-%d %H:%M:%S") #change type to data-format for the "Created"-column
+
+df$Reactions <- (df$Likes + df$Love + df$Wow + df$Haha + df$Sad + df$Angry + df$Care)
+
+df$attention <- (df$Reactions + df$Comments + df$Shares)
+
+df$size <- df$'Likes at Posting'
+df$size <- as.numeric(df$size) #change "size" to numeric
+df$size_with_NAs <- df$size
+df$size[is.na(df$size)] <- 0 #change NAs to zeroes (will need to double check that NA's should truly be zeroes!)
+
+df <- distinct(df, URL, .keep_all = TRUE) #remove URL duplicates (there weren't many, but there were a few)
+
+df$id <- seq.int(1:nrow(df)) #create ID column
+```
+
+### Select Variables of Interest for Later Steps
+
+```{r}
+df_all <- df %>% dplyr::select(Message, Created, Reactions, attention, size, size_with_NAs, id)
+
+#df_all <- df %>% dplyr::select(Message, Created, Reactions, id, Likes, Comments, Shares, Love, Wow, Haha, Sad, Angry, Care)
+
+df <- df %>%
+  dplyr::select(Message, Created, Reactions, id) #select our variables of interest
+```
+
+
+
+### Sample training set for supervised machine learning (200 posts)
+```{r}
+#traning_set <- df[sample(nrow(df), 200), ]  No need to do this more than once, so I've blocked it out
+
+#write_xlsx(traning_set,"training_set.xlsx")
+```
+
+
+### Create Corpus Using the Quanteda Package
+```{r}
+corpus <- corpus(df$Message,
+                 docnames = df$URL) #designating the URL as the ID of each post
+
+```
+
+### Tokenize
+
+```{r}
+
+df_tokens <- tokens(corpus, 
+                    remove_punct = TRUE,
+                    remove_symbols = TRUE,
+                    remove_numbers = TRUE,
+                    remove_url = TRUE)  
+
+df_tokens_clean <- tokens_select(df_tokens, pattern = stopwords("en"), selection = "remove") #remove stopwords
+
+df_tokens_clean <- tokens_select(df_tokens_clean, c("COVID-19", "covid-19", "covid", "COVID", "corona", "coronavirus", "Corona","Coronavirus"), selection = "remove") #removes corona-words (added 27-11-2020)
+
+```
+
+
+```{r}
+
+tokens_clean <- tokens_tolower(df_tokens_clean, keep_acronyms = FALSE) #makes everything lowercase, such that upper/lower case usage won't result in the same words being interpreted as different words.
+
+#tokens_low #checking that it worked
+```
+
+
+## Exploring the Data
+
+### Make a Wordcloud
+#### Create DFM
+
+```{r}
+tokens_clean_dfm <- dfm(tokens_clean)
+```
+
+
+#### Create the Wordcloud
+
+```{r}
+
+df_tokens_cloud <- tokens_select(df_tokens_clean, c("will", "can"), selection = "remove")
+tokens_cloud <- tokens_tolower(df_tokens_cloud, keep_acronyms = FALSE)
+tokens_cloud_dfm <- dfm(tokens_cloud)
+
+textplot_wordcloud(tokens_cloud_dfm
+                   , min_count = 10, random_order = FALSE,
+                   rotation = .25)
+
+rm("df_tokens_cloud", "tokens_cloud", "tokens_cloud_dfm")
+```
+
+Free up memory by deleting a bunch of stuff (optional):
+
+```{r}
+#rm("df_dfm_stem_cloud", "df_tokens", "df_tokens_clean", "df_tokens_cloud", "tokens_clean", "tokens_clean_dfm", "tokens_cloud", "tokens_cloud_dfm")
+```
+Notice that "people" is a quite common word! (I'll remove this word from the polarization dictionary in a bit!)
+
+
+### Dictionary Strategies
+
+#### Politicization Dictionary from Hart et al., 2020, NEW
+```{r}
+load_poli_dictionary <- read_csv("politicization_dictionary_hart_et_al.csv") #import dictionary
+
+poli_dictionary_list <- apply(load_poli_dictionary, 1, as.list) #the apply function option makes list within another list. 
+
+poli_unlisted_list <- unlist(poli_dictionary_list)
+poli_list2 <- list(poli_words = unlist(poli_dictionary_list))
+poli_mydict <- dictionary(poli_list2)
+
+poli_dic <- dfm(tokens_clean_dfm, dictionary = poli_mydict)
+
+poli_score <- convert(poli_dic, to = "data.frame")
+df$poli_score <- poli_score$poli_words
+df_all$poli_score <- poli_score$poli_words
+
+df$poli_score_binary <- ifelse(df$poli_score >= 1, 1, 0)
+
+df_all$poli_score_binary <- ifelse(df_all$poli_score >= 1, 1, 0)
+
+#then plot politicization stuff:
+
+df$week <- floor_date(df$Created, "week")
+df_week <- ddply(df, "week", summarise, poli_score_binary = mean(poli_score_binary))
+
+ggplot(df_week, aes(x = week, y = poli_score_binary)) + 
+  geom_line(aes(), size = .55) +
+  labs(title = "Politicization of COVID-19 Posts on Facebook",
+       y = "% of Posts Mentioning Political Actors",
+       x = "") +
+  theme_minimal()
+
+#most frequently used word from the poli_dic in the dataset:
+
+df_tokens_political_words <- tokens_select(df_tokens, pattern = poli_mydict) #select only tokens/words that are in the the polar dictionary
+
+political_words_dfm <- dfm(df_tokens_political_words) #turn into DFM format
+
+#These are the most frequently used polarizing words in the dataset (including the whole dictionary as it is relative short and might be worth a quick skim):
+political_words_dfm %>% 
+  textstat_frequency()
+
+prop.table(table(df_all$poli_score_binary))
+```
+
+See if it looks the same if using continuous variable as DV:
+
+```{r}
+df$week <- floor_date(df$Created, "week")
+df_week <- ddply(df, "week", summarise, poli_score = mean(poli_score))
+
+ggplot(df_week, aes(x = week, y = poli_score)) + 
+  geom_line(aes(), size = .55) +
+  labs(title = "Politicization of COVID-19 Posts on Facebook",
+       y = "% of Posts Mentioning Political Actors",
+       x = "") +
+  theme_minimal()
+```
+
+
+#### Apply the Polarization Dictionary
+
+```{r}
+#load_polarization_dictionary <- read_csv("edited_polarization_covid_dictionary.csv") #modified dictionary (full)
+
+load_polarization_dictionary <- read_csv("edited_polarization_covid_dictionary_no_names.csv") #modified dictionary (no politican names)
+
+dictionary_list <- apply(load_polarization_dictionary, 1, as.list) #the apply function option makes list within another list. 
+
+unlisted_list <- unlist(dictionary_list)
+list2 <- list(polarizing_words = unlist(dictionary_list))
+mydict <- dictionary(list2)
+
+polar_dic <- dfm(tokens_clean_dfm, dictionary = mydict)
+
+```
+
+
+#### Check which polarizing words are most used
+
+```{r}
+
+df_tokens_polarizing_words <- tokens_select(df_tokens, pattern = mydict) #select only tokens/words that are in the the polar dictionary
+
+#df_tokens_polarizing_words
+
+polar_words_dfm <- dfm(df_tokens_polarizing_words) #turn into DFM format
+
+#These are the most frequently used polarizing words in the dataset (including the whole dictionary as it is relative short and might be worth a quick skim):
+polar_words_dfm %>% 
+  textstat_frequency()
+
+```
+
+It's worth mentioning that if the word "people" had not been removed from the dictionary, it would have been #1 on the list above!
+
+#### Merge Polscores with DF – and visualize over-time development
+
+```{r}
+polscore <- convert(polar_dic, to = "data.frame")
+df$polscore <- polscore$polarizing_words
+df_all$polscore <- polscore$polarizing_words
+
+df$polscore_binary <- ifelse(df$polscore >= 1, 1, 0) #create polscore as a binary variable
+
+df$polscore_binary <- ifelse(df$polscore >= 1, 1, 0)
+
+df_all$polscore_binary <- ifelse(df_all$polscore >= 1, 1, 0)
+```
+
+#### Aggregate at different levels
+By month
+```{r}
+df$month <- floor_date(df$Created, "month")
+df_month <- ddply(df, "month", summarise, polscore = mean(polscore))
+```
+
+Question: Is the above by-month aggregation done correctly?
+
+```{r}
+ggplot(df_month, aes(x = month, y = polscore)) + 
+  geom_line(aes(), size = .55) +
+  labs(title = "Polarization of Coronavirus Posts on Facebook",
+       y = "Polarizing Language",
+       x = "")
+```
+
+By week
+```{r}
+
+df$week <- floor_date(df$Created, "week")
+df_week <- ddply(df, "week", summarise, polscore = mean(polscore))
+
+ggplot(df_week, aes(x = week, y = polscore)) + 
+  geom_line(aes(), size = .55) +
+  #geom_smooth() + #not sure if I like having the geom_smooth in there; probably not.
+  labs(title = "Polarization of Coronavirus Posts on Facebook",
+       y = "Polarizing Language",
+       x = "")
+
+```
+
+By week (using binary polscore)
+
+(Note that it looks about the same using the binary polscore as using the other polscore. It also looks about the same regardless of which of the two dictionaries above are used.)
+```{r}
+df$week <- floor_date(df$Created, "week")
+df_week <- ddply(df, "week", summarise, polscore_bin = mean(polscore_binary))
+
+ggplot(df_week, aes(x = week, y = polscore_bin)) + 
+  geom_line(aes(), size = .55) +
+  #geom_smooth() + #not sure if I like having the geom_smooth in there; probably not.
+  labs(title = "Polarization of Coronavirus Posts on Facebook",
+       y = "Proportion of Posts Using Polarizing Language",
+       x = "")
+```
+
+Without grey boxes in grid:
+
+```{r}
+df$week <- floor_date(df$Created, "week")
+df_week <- ddply(df, "week", summarise, polscore_bin = mean(polscore_binary))
+
+ggplot(df_week, aes(x = week, y = polscore_bin)) + 
+  geom_line(aes(), size = .55) +
+  #geom_smooth() + #not sure if I like having the geom_smooth in there; probably not.
+  labs(title = "Polarization of Coronavirus Posts on Facebook",
+       y = "% of Posts Using Polarizing Language",
+       x = "") +
+          theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+Count # of posts throughout the period:
+
+```{r}
+#assign the number "one" to each row/post
+df$thecount <- 1 
+
+#prepare to plot by week
+df$week <- floor_date(df$Created, "week")
+df_week <- ddply(df, "week", summarise, thecount = sum(thecount))
+
+#plot number of posts per week
+ggplot(df_week, aes(x = week, y = thecount)) + 
+  geom_line(aes(), size = .55) +
+  labs(title = "Posts About COVID-19 In English-Speaking Facebook Groups",
+       y = "# of posts per week",
+       x = "") +
+  theme_minimal()
+
+```
+
+Show count from above graph in table format:
+```{r}
+table(df_week$thecount) %>% prop.table()
+```
+
+##### Polarization Bonus (Did most messages in dataset include words from the polarization dictionary?)
+
+```{r}
+
+table(df$polscore)
+
+table(df_all$polscore_binary) %>% prop.table()
+
+```
+
+
+```{r}
+
+round(1-(4341676/nrow(df)), digits = 2)
+
+4601145/nrow(df)
+
+```
+
+Remove un-needed objects to free up memory (optional):
+```{r}
+#rm(df_tokens_positive_words, df_tokens_negative_words, df_tokens_polarizing_words)
+#rm(df, df_dfm_stem, df_tokens, df_tokens_clean, neg_words_dfm, pos_words_dfm, polar_words_dfm, polar_dic, sentiment_dic, tokens_clean)
+```
+
+### Regression analysis
+
+```{r}
+dfplot <- df
+dfplot$month_factor <- as.factor(months(df$Created))
+
+df_jan <- subset(dfplot,month_factor=="January")
+df_feb <- subset(dfplot,month_factor=="February")
+df_mar <- subset(dfplot,month_factor=="March")
+df_apr <- subset(dfplot,month_factor=="April")
+df_may <- subset(dfplot,month_factor=="May")
+
+```
+
+#### Data Wrangling for Regression
+I am using the datafram "df_all" for the regression because some of the varaibles was stripped from DF earlier to make the corpus/token-files smaller.
+
+I already have the DV (Reactions) and the IV (polscore_binary) in the dataframe ("df"). I just the need the control variables (time of day + month). So, create variables that will let me control for time (time of day + month):
+
+```{r}
+#create factor for month-variable
+df_all$month_factor <- months(df$month)
+df_all$month_factor <- as.factor(df_all$month_factor)
+
+#create factor for time of day
+breaks <- hour(hm("00:00", "6:00", "12:00", "18:00", "23:59")) # labels for the breaks
+labels <- c("Night", "Morning", "Afternoon", "Evening") #write the labels
+
+df_all$Time_of_day <- cut(x=hour(df_all$Created), breaks = breaks, labels = labels, include.lowest=TRUE)
+```
+
+I also need to get the polarization score into the DF I'm using for regression:
+```{r}
+df_all$polscore_binary <- df$polscore_binary
+```
+
+
+#### Negative binominal regression:
+
+See what distribution of the DV (rections) looks like:
+
+```{r echo = FALSE, fig.width=7, fig.height=3}
+ggplot(df_all,aes(Reactions)) + 
+  geom_histogram(colour="dodgerblue2", size=1, fill="dodgerblue2") + scale_x_log10('Number of Posts', breaks = breaks, labels = breaks) + ## Many rows removed!!!!!!!!!
+  labs(title = "Distribution of Reactions",
+       y = "Number of Reactions") +
+  theme_minimal()
+#looks like count data
+```
+
+
+Remove large objects (optional)
+```{r}
+#rm(df_tokens_positive_words, df_tokens_negative_words, df_tokens_polarizing_words, df_dfm_stem, df_tokens, df_tokens_clean, neg_words_dfm, pos_words_dfm, polar_words_dfm, polar_dic, sentiment_dic, tokens_clean, tokens_clean_dfm)
+
+#rm(df_tokens_political_words, poli_dic, poli_dictionary_list, poli_list2, poli_mydict, political_words_dfm, dat_csv, df_apr, df_cor, df_feb, df_jan, df_mar, df_may, df_month, df_week, dfplot, dictionary_list, list2, load_polarization_dictionary, load_poli_dictionary, mydict, poli_score, polscore, corpus, df)
+
+```
+
+Run the regression analysis:
+```{r}
+library(MASS) #load at this late point to not interfere with other packages above
+
+#do model with ATTENTION as the DV and remember to control for time + gorup size
+m3 <- glm.nb(formula = attention ~ polscore_binary + month_factor + Time_of_day + size, data = df_all, link = log)
+summary(m3) 
+
+```
+
+#### Some descriptive stats
+Check how many polarizing words were present in the most polarizing message
+```{r}
+summary(df_all$polscore)
+```
+
+
+Count means and SD for attention variable:
+```{r}
+mean(df_all$Reactions) #for descriptives
+sd(df_all$Reactions)
+summary(df_all$Reactions)
+```
+
+
+Combined attention measure (incl Comments and Shares)
+```{r}
+
+mean(df_all$attention)
+sd(df_all$attention)
+summary(df_all$attention)
+
+```
+
+## The End
+
+```{r}
+stript_end <- Sys.time()
+(run_time <- stript_end - script_start) #how long it took to run
+```
